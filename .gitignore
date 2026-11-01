@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Production build outputs (built on Render during deployment)
+frontend/dist/
+dist/
+
+# Environment and sensitive keys
+.env
+.env.*
+.env.local
+!.env.example
+
+# Logs and OS files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+.vscode/
