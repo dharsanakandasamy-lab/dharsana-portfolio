@@ -2,7 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { db } = require('../db');
-const { verifyAdmin, JWT_SECRET } = require('../middleware/auth');
+const { verifyAdmin, getJwtSecret } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -25,9 +25,14 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
+    const secret = getJwtSecret();
+    if (!secret) {
+      return res.status(503).json({ error: 'Server authentication configuration missing (JWT_SECRET).' });
+    }
+
     const token = jwt.sign(
       { id: admin.id, email: admin.email },
-      JWT_SECRET,
+      secret,
       { expiresIn: '7d' }
     );
 

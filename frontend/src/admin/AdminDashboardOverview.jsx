@@ -228,13 +228,15 @@ export default function AdminDashboardOverview({ token, onNavigateTab, showToast
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '13px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: '#cbd5e1' }}>
                 <span>Database Engine:</span>
-                <strong style={{ color: metrics?.dbMode === 'postgresql' ? '#34d399' : '#38bdf8' }}>
-                  {metrics?.dbMode === 'postgresql' ? 'PostgreSQL (Cloud)' : 'Persistent Local Storage'}
+                <strong style={{ color: metrics?.dbMode === 'supabase_postgresql' ? '#34d399' : '#38bdf8' }}>
+                  {metrics?.dbMode === 'supabase_postgresql' ? 'Supabase PostgreSQL' : 'Local Dev Engine'}
                 </strong>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: '#cbd5e1' }}>
                 <span>File Storage:</span>
-                <strong style={{ color: '#34d399' }}>Active (/uploads)</strong>
+                <strong style={{ color: metrics?.storageConfigured ? '#34d399' : '#a78bfa' }}>
+                  {metrics?.storageConfigured ? 'Supabase Storage' : 'Active (Direct / Local)'}
+                </strong>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: '#cbd5e1' }}>
                 <span>Public Portfolio Sync:</span>

@@ -37,11 +37,6 @@ export default function AdminLogin({ onLoginSuccess }) {
     }
   };
 
-  const handleUseDefault = () => {
-    setEmail('admin@dharsana.dev');
-    setPassword('DharsanaAdmin@2029');
-  };
-
   return (
     <div className="adminLoginWrapper">
       <div className="loginCard">
@@ -118,19 +113,6 @@ export default function AdminLogin({ onLoginSuccess }) {
             )}
           </button>
         </form>
-
-        <div style={{ marginTop: '20px', padding: '12px', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: '1px solid #1f293d', textAlign: 'center' }}>
-          <p style={{ fontSize: '12px', color: '#94a3b8', margin: '0 0 6px 0' }}>
-            First time logging in?
-          </p>
-          <button
-            type="button"
-            onClick={handleUseDefault}
-            style={{ background: 'none', border: 'none', color: '#c4b5fd', fontSize: '12px', fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' }}
-          >
-            Auto-fill Default Admin Credentials
-          </button>
-        </div>
 
         <div className="loginBackLink">
           <a href="/" onClick={(e) => { e.preventDefault(); window.location.href = '/'; }}>

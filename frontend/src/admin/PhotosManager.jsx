@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { uploadMediaFile } from './uploadHelper';
 import {
   Image,
   Plus,
@@ -81,19 +82,9 @@ export default function PhotosManager({ token, showToast }) {
     const file = e.target.files[0];
     if (!file) return;
 
-    const data = new FormData();
-    data.append('file', file);
-
     setUploading(true);
     try {
-      const res = await fetch('/api/admin/upload', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: data
-      });
-
-      const resData = await res.json();
-      if (!res.ok) throw new Error(resData.error || 'Upload failed');
+      const resData = await uploadMediaFile(file, 'photos', token);
 
       setFormData((prev) => ({
         ...prev,

@@ -7,29 +7,32 @@ const path = require('path');
 const fs = require('fs');
 
 const { initDb, db } = require('./db');
+const supabaseHelper = require('./supabase');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
 const publicRoutes = require('./routes/public');
 
 const app = express();
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
 
 app.disable('x-powered-by');
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Ensure uploads folder exists and serve static uploads
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+// For local offline development, serve uploads if directory exists
+if (!isProduction) {
+  const uploadsDir = path.join(__dirname, 'uploads');
+  if (fs.existsSync(uploadsDir)) {
+    app.use('/uploads', express.static(uploadsDir));
+  }
 }
-app.use('/uploads', express.static(uploadsDir));
 
-// Rate limiters
+// Rate limiters (protect endpoints from brute-force)
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 15,
+  limit: 20,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Too many login attempts. Please try again after 15 minutes.' }
@@ -37,9 +40,37 @@ const loginLimiter = rateLimit({
 
 const contactLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 8,
+  limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false
+});
+
+// Lazy DB initialization middleware (handles serverless cold starts seamlessly)
+let initPromise = null;
+function ensureDbReady() {
+  if (!initPromise) {
+    initPromise = initDb().catch((err) => {
+      console.error('[DB] Cold-start initialization error:', err.message);
+      initPromise = null; // Allow retry on subsequent requests
+      throw err;
+    });
+  }
+  return initPromise;
+}
+
+app.use(async (req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    try {
+      await ensureDbReady();
+    } catch (err) {
+      if (isProduction) {
+        return res.status(503).json({
+          error: 'Database connection failed. Please ensure DATABASE_URL is properly configured in your Supabase & Vercel settings.'
+        });
+      }
+    }
+  }
+  next();
 });
 
 // API Routes
@@ -56,6 +87,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     mode: db.getMode(),
+    storage: supabaseHelper.isConfigured() ? 'supabase' : (isProduction ? 'unconfigured' : 'local_dev'),
     timestamp: new Date().toISOString()
   });
 });
@@ -88,26 +120,34 @@ app.post('/api/contact', contactLimiter, async (req, res) => {
   }
 });
 
-// Serve frontend in production
-const dist = path.join(__dirname, '../frontend/dist');
-app.use(express.static(dist));
-app.get('*', (req, res) => {
-  // If request is for an API route that does not exist, return 404 JSON
-  if (req.path.startsWith('/api/')) {
-    return res.status(404).json({ error: 'API endpoint not found.' });
+// For standalone server running outside Vercel (e.g. Render, VPS, or local preview)
+if (!process.env.VERCEL) {
+  const dist = path.join(__dirname, '../frontend/dist');
+  if (fs.existsSync(dist)) {
+    app.use(express.static(dist));
+    app.get('*', (req, res) => {
+      if (req.path.startsWith('/api/')) {
+        return res.status(404).json({ error: 'API endpoint not found.' });
+      }
+      res.sendFile(path.join(dist, 'index.html'));
+    });
   }
-  res.sendFile(path.join(dist, 'index.html'));
-});
+}
 
 const port = Number(process.env.PORT) || 10000;
 
-initDb()
-  .then(() => {
-    app.listen(port, '0.0.0.0', () => {
-      console.log(`[Server] Dharsana Portfolio & Admin running on port ${port}`);
+// Start HTTP listener only when run directly (not when required as a serverless module by Vercel)
+if (require.main === module && !process.env.VERCEL) {
+  ensureDbReady()
+    .then(() => {
+      app.listen(port, '0.0.0.0', () => {
+        console.log(`[Server] Dharsana Portfolio & Admin running on port ${port} (mode: ${db.getMode()})`);
+      });
+    })
+    .catch((err) => {
+      console.error('[Server] Fatal startup error:', err.message);
+      if (isProduction) process.exit(1);
     });
-  })
-  .catch((err) => {
-    console.error('[Server] Fatal startup error:', err);
-    process.exit(1);
-  });
+}
+
+module.exports = app;

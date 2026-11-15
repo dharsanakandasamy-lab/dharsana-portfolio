@@ -175,7 +175,7 @@ export default function SettingsManager({ token, user, showToast, onLogout }) {
             <b>Projects</b>, <b>Photos</b>, and <b>Videos</b>.
           </p>
           <p style={{ margin: '0 0 10px 0' }}>
-            When deployed to Render with a PostgreSQL database, set the <code>DATABASE_URL</code> environment variable. Files uploaded are permanently accessible at <code>/uploads/*</code>.
+            Powered by <b>Supabase PostgreSQL</b> with connection pooling and <b>Supabase Storage</b> (<code>portfolio-media</code> bucket). Media assets are served directly via Supabase's high-speed global CDN.
           </p>
         </div>
 

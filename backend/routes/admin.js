@@ -4,58 +4,52 @@ const path = require('path');
 const fs = require('fs');
 const { db } = require('../db');
 const { verifyAdmin } = require('../middleware/auth');
+const supabaseHelper = require('../supabase');
 
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
 const router = express.Router();
 
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, '../uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+// Fallback uploads directory for local offline development only
+const localUploadsDir = path.join(__dirname, '../uploads');
+if (!isProduction && !fs.existsSync(localUploadsDir)) {
+  fs.mkdirSync(localUploadsDir, { recursive: true });
 }
 
-// Multer Storage Configuration
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const sanitizedBase = path
-      .basename(file.originalname, ext)
-      .replace(/[^a-zA-Z0-9-_]/g, '_')
-      .slice(0, 40);
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, `${sanitizedBase}-${uniqueSuffix}${ext}`);
-  }
-});
+// Allowed MIME types
+const ALLOWED_MIME_TYPES = [
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'image/svg+xml',
+  'application/pdf',
+  'video/mp4',
+  'video/webm',
+  'video/ogg'
+];
 
-// File filter for images, documents (PDF), and videos
+// Memory storage for serverless-safe uploads (files <= 4MB)
+const storage = multer.memoryStorage();
+
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = [
-    'image/jpeg',
-    'image/jpg',
-    'image/png',
-    'image/webp',
-    'image/gif',
-    'image/svg+xml',
-    'application/pdf',
-    'video/mp4',
-    'video/webm',
-    'video/ogg'
-  ];
-
-  if (allowedTypes.includes(file.mimetype)) {
+  if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error(`Unsupported file type: ${file.mimetype}. Allowed: Images (JPG, PNG, WebP), PDFs, and Videos (MP4, WebM)`));
+    cb(
+      new Error(
+        `Unsupported file type: ${file.mimetype}. Allowed types: JPG, PNG, WebP, GIF, SVG, PDF, MP4, WebM.`
+      )
+    );
   }
 };
 
+// 4MB limit for serverless proxy upload (keeps requests safely under Vercel's 4.5MB limit)
 const upload = multer({
   storage,
   fileFilter,
   limits: {
-    fileSize: 45 * 1024 * 1024 // 45MB max
+    fileSize: 4 * 1024 * 1024
   }
 });
 
@@ -63,15 +57,61 @@ const upload = multer({
 router.use(verifyAdmin);
 
 // ==========================================
-// FILE UPLOAD ENDPOINT
+// FILE UPLOAD ENDPOINT (DIRECT / BUFFER)
 // ==========================================
-router.post('/upload', upload.single('file'), (req, res) => {
+router.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded.' });
     }
 
-    const fileUrl = `/uploads/${req.file.filename}`;
+    const folder = req.body.folder || 'general';
+
+    // If Supabase Storage is configured, upload directly to Supabase Storage bucket
+    if (supabaseHelper.isConfigured()) {
+      const uploaded = await supabaseHelper.uploadBuffer(
+        req.file.buffer,
+        req.file.originalname,
+        req.file.mimetype,
+        folder
+      );
+
+      const fileType = req.file.mimetype.startsWith('video/')
+        ? 'video'
+        : req.file.mimetype === 'application/pdf'
+        ? 'pdf'
+        : 'image';
+
+      return res.status(201).json({
+        success: true,
+        url: uploaded.url,
+        fileName: req.file.originalname,
+        storagePath: uploaded.path,
+        fileType,
+        size: uploaded.size,
+        mimetype: req.file.mimetype,
+        storageProvider: 'supabase'
+      });
+    }
+
+    // In production, Supabase Storage is required
+    if (isProduction) {
+      return res.status(503).json({
+        error: 'Storage service unavailable. SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured.'
+      });
+    }
+
+    // Local offline development fallback
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    const sanitizedBase = path
+      .basename(req.file.originalname, ext)
+      .replace(/[^a-zA-Z0-9-_]/g, '_')
+      .slice(0, 36);
+    const filename = `${sanitizedBase}-${Date.now()}${ext}`;
+    const localFilePath = path.join(localUploadsDir, filename);
+
+    fs.writeFileSync(localFilePath, req.file.buffer);
+
     const fileType = req.file.mimetype.startsWith('video/')
       ? 'video'
       : req.file.mimetype === 'application/pdf'
@@ -80,16 +120,55 @@ router.post('/upload', upload.single('file'), (req, res) => {
 
     return res.status(201).json({
       success: true,
-      url: fileUrl,
+      url: `/uploads/${filename}`,
       fileName: req.file.originalname,
-      storedName: req.file.filename,
+      storedName: filename,
       fileType,
       size: req.file.size,
-      mimetype: req.file.mimetype
+      mimetype: req.file.mimetype,
+      storageProvider: 'local_dev'
     });
   } catch (err) {
     console.error('File upload error:', err);
-    return res.status(500).json({ error: 'Failed to process file upload.' });
+    return res.status(500).json({ error: err.message || 'Failed to process file upload.' });
+  }
+});
+
+// ==========================================
+// SIGNED UPLOAD URL ENDPOINT (FOR LARGE FILES > 4MB UP TO 50MB)
+// ==========================================
+router.post('/storage/sign-upload', async (req, res) => {
+  try {
+    const { fileName, fileType, folder = 'general' } = req.body || {};
+
+    if (!fileName || !fileType) {
+      return res.status(400).json({ error: 'fileName and fileType are required.' });
+    }
+
+    if (!ALLOWED_MIME_TYPES.includes(fileType)) {
+      return res.status(400).json({
+        error: `Unsupported file type: ${fileType}. Allowed: Images, PDFs, and MP4/WebM Videos.`
+      });
+    }
+
+    if (!supabaseHelper.isConfigured()) {
+      if (isProduction) {
+        return res.status(503).json({ error: 'Supabase Storage is not configured.' });
+      }
+      return res.status(400).json({
+        error: 'Signed uploads require Supabase Storage configuration (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY).'
+      });
+    }
+
+    const signedData = await supabaseHelper.createSignedUploadUrl(fileName, fileType, folder);
+
+    return res.json({
+      success: true,
+      ...signedData
+    });
+  } catch (err) {
+    console.error('Signed upload error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to generate signed upload URL.' });
   }
 });
 
@@ -97,7 +176,9 @@ router.post('/upload', upload.single('file'), (req, res) => {
 router.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File size exceeds maximum limit of 45MB.' });
+      return res.status(400).json({
+        error: 'File exceeds direct upload size limit of 4MB. For larger videos or files, use the signed upload method.'
+      });
     }
     return res.status(400).json({ error: `Upload error: ${err.message}` });
   } else if (err) {
@@ -114,11 +195,12 @@ router.get('/overview', async (req, res) => {
     const data = await db.getOverviewMetrics();
     return res.json({
       success: true,
-      ...data
+      ...data,
+      storageConfigured: supabaseHelper.isConfigured()
     });
   } catch (err) {
     console.error('Overview error:', err);
-    return res.status(500).json({ error: 'Failed to fetch dashboard metrics.' });
+    return res.status(500).json({ error: err.message || 'Failed to fetch dashboard metrics.' });
   }
 });
 
@@ -130,7 +212,7 @@ router.get('/certificates', async (req, res) => {
     const items = await db.getCertificates({ onlyPublished: false });
     return res.json({ success: true, items });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch certificates.' });
+    return res.status(500).json({ error: err.message || 'Failed to fetch certificates.' });
   }
 });
 
@@ -145,7 +227,7 @@ router.post('/certificates', async (req, res) => {
     return res.status(201).json({ success: true, item: created });
   } catch (err) {
     console.error('Create certificate error:', err);
-    return res.status(500).json({ error: 'Failed to create certificate.' });
+    return res.status(500).json({ error: err.message || 'Failed to create certificate.' });
   }
 });
 
@@ -158,7 +240,7 @@ router.put('/certificates/:id', async (req, res) => {
     }
     return res.json({ success: true, item: updated });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to update certificate.' });
+    return res.status(500).json({ error: err.message || 'Failed to update certificate.' });
   }
 });
 
@@ -173,20 +255,27 @@ router.patch('/certificates/:id/status', async (req, res) => {
     if (!updated) return res.status(404).json({ error: 'Certificate not found.' });
     return res.json({ success: true, item: updated });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to change certificate status.' });
+    return res.status(500).json({ error: err.message || 'Failed to change certificate status.' });
   }
 });
 
 router.delete('/certificates/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const item = await db.getCertificateById(id);
     const deleted = await db.deleteCertificate(id);
     if (!deleted) {
       return res.status(404).json({ error: 'Certificate not found.' });
     }
+
+    // Clean up file in Supabase Storage if hosted there
+    if (item && item.file_url) {
+      await supabaseHelper.deleteFileByUrl(item.file_url);
+    }
+
     return res.json({ success: true, message: 'Certificate deleted successfully.' });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to delete certificate.' });
+    return res.status(500).json({ error: err.message || 'Failed to delete certificate.' });
   }
 });
 
@@ -198,7 +287,7 @@ router.get('/projects', async (req, res) => {
     const items = await db.getProjects({ onlyPublished: false });
     return res.json({ success: true, items });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch projects.' });
+    return res.status(500).json({ error: err.message || 'Failed to fetch projects.' });
   }
 });
 
@@ -213,7 +302,7 @@ router.post('/projects', async (req, res) => {
     return res.status(201).json({ success: true, item: created });
   } catch (err) {
     console.error('Create project error:', err);
-    return res.status(500).json({ error: 'Failed to create project.' });
+    return res.status(500).json({ error: err.message || 'Failed to create project.' });
   }
 });
 
@@ -226,7 +315,7 @@ router.put('/projects/:id', async (req, res) => {
     }
     return res.json({ success: true, item: updated });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to update project.' });
+    return res.status(500).json({ error: err.message || 'Failed to update project.' });
   }
 });
 
@@ -241,20 +330,26 @@ router.patch('/projects/:id/status', async (req, res) => {
     if (!updated) return res.status(404).json({ error: 'Project not found.' });
     return res.json({ success: true, item: updated });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to change project status.' });
+    return res.status(500).json({ error: err.message || 'Failed to change project status.' });
   }
 });
 
 router.delete('/projects/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const item = await db.getProjectById(id);
     const deleted = await db.deleteProject(id);
     if (!deleted) {
       return res.status(404).json({ error: 'Project not found.' });
     }
+
+    if (item && item.thumbnail_url) {
+      await supabaseHelper.deleteFileByUrl(item.thumbnail_url);
+    }
+
     return res.json({ success: true, message: 'Project deleted successfully.' });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to delete project.' });
+    return res.status(500).json({ error: err.message || 'Failed to delete project.' });
   }
 });
 
@@ -266,7 +361,7 @@ router.get('/photos', async (req, res) => {
     const items = await db.getPhotos({ onlyPublished: false });
     return res.json({ success: true, items });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch photos.' });
+    return res.status(500).json({ error: err.message || 'Failed to fetch photos.' });
   }
 });
 
@@ -280,7 +375,7 @@ router.post('/photos', async (req, res) => {
     const created = await db.createPhoto(req.body);
     return res.status(201).json({ success: true, item: created });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to create photo.' });
+    return res.status(500).json({ error: err.message || 'Failed to create photo.' });
   }
 });
 
@@ -291,7 +386,7 @@ router.put('/photos/:id', async (req, res) => {
     if (!updated) return res.status(404).json({ error: 'Photo not found.' });
     return res.json({ success: true, item: updated });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to update photo.' });
+    return res.status(500).json({ error: err.message || 'Failed to update photo.' });
   }
 });
 
@@ -303,18 +398,24 @@ router.patch('/photos/:id/status', async (req, res) => {
     if (!updated) return res.status(404).json({ error: 'Photo not found.' });
     return res.json({ success: true, item: updated });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to update photo status.' });
+    return res.status(500).json({ error: err.message || 'Failed to update photo status.' });
   }
 });
 
 router.delete('/photos/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const item = await db.getPhotoById(id);
     const deleted = await db.deletePhoto(id);
     if (!deleted) return res.status(404).json({ error: 'Photo not found.' });
+
+    if (item && item.image_url) {
+      await supabaseHelper.deleteFileByUrl(item.image_url);
+    }
+
     return res.json({ success: true, message: 'Photo deleted successfully.' });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to delete photo.' });
+    return res.status(500).json({ error: err.message || 'Failed to delete photo.' });
   }
 });
 
@@ -326,7 +427,7 @@ router.get('/videos', async (req, res) => {
     const items = await db.getVideos({ onlyPublished: false });
     return res.json({ success: true, items });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch videos.' });
+    return res.status(500).json({ error: err.message || 'Failed to fetch videos.' });
   }
 });
 
@@ -340,7 +441,7 @@ router.post('/videos', async (req, res) => {
     const created = await db.createVideo(req.body);
     return res.status(201).json({ success: true, item: created });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to create video.' });
+    return res.status(500).json({ error: err.message || 'Failed to create video.' });
   }
 });
 
@@ -351,7 +452,7 @@ router.put('/videos/:id', async (req, res) => {
     if (!updated) return res.status(404).json({ error: 'Video not found.' });
     return res.json({ success: true, item: updated });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to update video.' });
+    return res.status(500).json({ error: err.message || 'Failed to update video.' });
   }
 });
 
@@ -363,18 +464,25 @@ router.patch('/videos/:id/status', async (req, res) => {
     if (!updated) return res.status(404).json({ error: 'Video not found.' });
     return res.json({ success: true, item: updated });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to update video status.' });
+    return res.status(500).json({ error: err.message || 'Failed to update video status.' });
   }
 });
 
 router.delete('/videos/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const item = await db.getVideoById(id);
     const deleted = await db.deleteVideo(id);
     if (!deleted) return res.status(404).json({ error: 'Video not found.' });
+
+    if (item) {
+      if (item.video_url) await supabaseHelper.deleteFileByUrl(item.video_url);
+      if (item.thumbnail_url) await supabaseHelper.deleteFileByUrl(item.thumbnail_url);
+    }
+
     return res.json({ success: true, message: 'Video deleted successfully.' });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to delete video.' });
+    return res.status(500).json({ error: err.message || 'Failed to delete video.' });
   }
 });
 

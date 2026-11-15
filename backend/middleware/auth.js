@@ -1,10 +1,19 @@
 const jwt = require('jsonwebtoken');
 const { db } = require('../db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dharsana_portfolio_super_secure_admin_jwt_secret_2029';
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
+const JWT_SECRET = process.env.JWT_SECRET || (!isProduction ? 'dev_only_jwt_secret_local_testing' : null);
+
+if (isProduction && !process.env.JWT_SECRET) {
+  console.error('[Auth] CRITICAL SECURITY WARNING: JWT_SECRET environment variable is not defined.');
+}
 
 async function verifyAdmin(req, res, next) {
   try {
+    if (!JWT_SECRET) {
+      return res.status(503).json({ error: 'Authentication service configuration error (missing JWT_SECRET).' });
+    }
+
     const authHeader = req.headers.authorization || req.headers['x-admin-token'];
     let token = '';
 
@@ -40,5 +49,5 @@ async function verifyAdmin(req, res, next) {
 
 module.exports = {
   verifyAdmin,
-  JWT_SECRET
+  getJwtSecret: () => JWT_SECRET
 };

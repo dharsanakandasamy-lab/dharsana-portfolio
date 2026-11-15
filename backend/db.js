@@ -3,21 +3,37 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
 const hasDbUrl = Boolean(process.env.DATABASE_URL);
+
+// Determine SSL requirements: Supabase, Neon, and cloud PostgreSQL require SSL
+const shouldUseSsl =
+  process.env.DB_SSL === 'true' ||
+  (process.env.DATABASE_URL &&
+    (process.env.DATABASE_URL.includes('supabase.') ||
+      process.env.DATABASE_URL.includes('neon.tech') ||
+      process.env.DATABASE_URL.includes('render.com')));
+
+// Configure connection pool with settings optimized for serverless & Supabase Transaction Pooler (port 6543)
 const pool = hasDbUrl
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined
+      ssl: shouldUseSsl ? { rejectUnauthorized: false } : undefined,
+      max: Math.min(Number(process.env.PG_MAX_POOL) || 4, 10), // Small pool for serverless instances
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000
     })
   : null;
 
 let isPgReady = false;
+let initPromise = null;
 
-// Local JSON DB fallback path
+// Local JSON DB fallback path (strictly for local offline development only)
 const dataDir = path.join(__dirname, 'data');
 const localDbPath = path.join(dataDir, 'db.json');
 
 function ensureLocalDb() {
+  if (isProduction) return; // Never create or use local filesystem in production
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
   }
@@ -35,44 +51,61 @@ function ensureLocalDb() {
 }
 
 function readLocalDb() {
+  if (isProduction) {
+    throw new Error('Local JSON database is disabled in production. Supabase PostgreSQL is required.');
+  }
   ensureLocalDb();
   try {
     const raw = fs.readFileSync(localDbPath, 'utf8');
     return JSON.parse(raw);
   } catch (err) {
-    console.error('Error reading local DB, resetting to defaults:', err.message);
+    console.error('Error reading local DB:', err.message);
     return { admin_users: [], certificates: [], projects: [], photos: [], videos: [], messages: [] };
   }
 }
 
 function writeLocalDb(data) {
+  if (isProduction) {
+    throw new Error('Local JSON database writes are disabled in production. Supabase PostgreSQL is required.');
+  }
   ensureLocalDb();
   fs.writeFileSync(localDbPath, JSON.stringify(data, null, 2), 'utf8');
 }
 
-// Seed default admin if missing
-async function seedDefaultAdmin() {
-  const email = (process.env.ADMIN_EMAIL || 'admin@dharsana.dev').trim().toLowerCase();
-  const password = process.env.ADMIN_PASSWORD || 'DharsanaAdmin@2029';
+// Seed initial admin account securely using ONLY environment variables (never hardcoded)
+async function seedInitialAdmin() {
+  const email = process.env.ADMIN_EMAIL ? process.env.ADMIN_EMAIL.trim().toLowerCase() : null;
+  const password = process.env.ADMIN_PASSWORD ? process.env.ADMIN_PASSWORD.trim() : null;
+
+  if (!email || !password) {
+    console.log('[DB] ADMIN_EMAIL or ADMIN_PASSWORD not configured. Skipping admin account creation.');
+    return;
+  }
+
+  if (password.length < 8) {
+    console.warn('[DB] WARNING: ADMIN_PASSWORD should be at least 8 characters long for security.');
+    return;
+  }
+
   const hash = await bcrypt.hash(password, 10);
 
   if (isPgReady && pool) {
     try {
-      const res = await pool.query('SELECT id FROM admin_users LIMIT 1');
+      const res = await pool.query('SELECT id, email FROM admin_users LIMIT 1');
       if (res.rows.length === 0) {
         await pool.query(
           'INSERT INTO admin_users (email, password_hash) VALUES ($1, $2)',
           [email, hash]
         );
-        console.log(`[DB] Default admin seeded in PostgreSQL: ${email}`);
+        console.log(`[DB] Initial admin account securely initialized in PostgreSQL for: ${email}`);
       }
     } catch (err) {
-      console.error('[DB] Failed to check/seed admin in PostgreSQL:', err.message);
+      console.error('[DB] Failed to verify/seed admin in PostgreSQL:', err.message);
     }
-  } else {
-    const db = readLocalDb();
-    if (!db.admin_users || db.admin_users.length === 0) {
-      db.admin_users = [
+  } else if (!isProduction) {
+    const local = readLocalDb();
+    if (!local.admin_users || local.admin_users.length === 0) {
+      local.admin_users = [
         {
           id: 1,
           email,
@@ -81,15 +114,21 @@ async function seedDefaultAdmin() {
           updated_at: new Date().toISOString()
         }
       ];
-      writeLocalDb(db);
-      console.log(`[DB] Default admin seeded in local database: ${email}`);
+      writeLocalDb(local);
+      console.log(`[DB] Initial admin account created in local development database: ${email}`);
     }
   }
 }
 
-// Initialize tables in PostgreSQL
-async function initDb() {
-  ensureLocalDb();
+// Initialize tables in Supabase PostgreSQL
+async function executeDbInit() {
+  if (isProduction) {
+    if (!pool) {
+      throw new Error('[DB] FATAL: DATABASE_URL must be configured in production. Supabase PostgreSQL is required.');
+    }
+  } else {
+    ensureLocalDb();
+  }
 
   if (pool) {
     try {
@@ -167,25 +206,52 @@ async function initDb() {
         );
       `);
       isPgReady = true;
-      console.log('[DB] PostgreSQL connected and tables initialized successfully.');
+      console.log('[DB] PostgreSQL connected and tables verified successfully.');
     } catch (err) {
-      console.warn('[DB] PostgreSQL initialization failed, switching to local DB:', err.message);
       isPgReady = false;
+      if (isProduction) {
+        console.error('[DB] PostgreSQL initialization failed in production:', err.message);
+        throw new Error(`[DB] Supabase PostgreSQL initialization failed: ${err.message}`);
+      } else {
+        console.warn('[DB] PostgreSQL initialization failed in development, using local JSON:', err.message);
+      }
     }
   } else {
-    console.log('[DB] DATABASE_URL not set; using local persistent JSON storage.');
+    console.log('[DB] Running in local development mode without DATABASE_URL. Using backend/data/db.json.');
   }
 
-  await seedDefaultAdmin();
+  await seedInitialAdmin();
 }
 
-// Unified Database Helpers
+// Caches the init promise so serverless warm containers don't re-run DDL on every invocation
+function initDb() {
+  if (!initPromise) {
+    initPromise = executeDbInit().catch((err) => {
+      initPromise = null; // Allow retry on subsequent invocations
+      throw err;
+    });
+  }
+  return initPromise;
+}
+
+function assertDbAvailable() {
+  if (isProduction && !isPgReady) {
+    throw new Error('Database service is currently unavailable. Please verify DATABASE_URL and Supabase status.');
+  }
+}
+
+// Database Helpers
 const db = {
-  isReady: () => isPgReady || true,
-  getMode: () => (isPgReady ? 'postgresql' : 'local_json'),
+  isReady: () => isPgReady || (!isProduction),
+  getMode: () => {
+    if (isPgReady) return 'supabase_postgresql';
+    if (!isProduction) return 'local_json_dev';
+    return 'unavailable';
+  },
 
   // ADMIN USERS
   findAdminByEmail: async (email) => {
+    assertDbAvailable();
     const cleanEmail = email.trim().toLowerCase();
     if (isPgReady) {
       const res = await pool.query('SELECT * FROM admin_users WHERE email = $1', [cleanEmail]);
@@ -196,6 +262,7 @@ const db = {
   },
 
   findAdminById: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('SELECT id, email, created_at, updated_at FROM admin_users WHERE id = $1', [id]);
       return res.rows[0] || null;
@@ -208,6 +275,7 @@ const db = {
   },
 
   updateAdminPassword: async (id, newHash) => {
+    assertDbAvailable();
     const now = new Date().toISOString();
     if (isPgReady) {
       await pool.query('UPDATE admin_users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [newHash, id]);
@@ -226,6 +294,7 @@ const db = {
 
   // CERTIFICATES
   getCertificates: async ({ onlyPublished = false } = {}) => {
+    assertDbAvailable();
     if (isPgReady) {
       const query = onlyPublished
         ? "SELECT * FROM certificates WHERE status = 'published' ORDER BY created_at DESC"
@@ -240,6 +309,7 @@ const db = {
   },
 
   getCertificateById: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('SELECT * FROM certificates WHERE id = $1', [id]);
       return res.rows[0] || null;
@@ -249,6 +319,7 @@ const db = {
   },
 
   createCertificate: async (data) => {
+    assertDbAvailable();
     const {
       title,
       issuer,
@@ -292,6 +363,7 @@ const db = {
   },
 
   updateCertificate: async (id, data) => {
+    assertDbAvailable();
     if (isPgReady) {
       const current = await db.getCertificateById(id);
       if (!current) return null;
@@ -330,6 +402,7 @@ const db = {
   },
 
   deleteCertificate: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('DELETE FROM certificates WHERE id = $1 RETURNING *', [id]);
       return res.rows[0] || null;
@@ -344,6 +417,7 @@ const db = {
 
   // PROJECTS
   getProjects: async ({ onlyPublished = false } = {}) => {
+    assertDbAvailable();
     if (isPgReady) {
       const query = onlyPublished
         ? "SELECT * FROM projects WHERE status = 'published' ORDER BY featured DESC, sort_order ASC, created_at DESC"
@@ -361,6 +435,7 @@ const db = {
   },
 
   getProjectById: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('SELECT * FROM projects WHERE id = $1', [id]);
       return res.rows[0] || null;
@@ -370,6 +445,7 @@ const db = {
   },
 
   createProject: async (data) => {
+    assertDbAvailable();
     const {
       title,
       description,
@@ -415,6 +491,7 @@ const db = {
   },
 
   updateProject: async (id, data) => {
+    assertDbAvailable();
     if (isPgReady) {
       const current = await db.getProjectById(id);
       if (!current) return null;
@@ -456,6 +533,7 @@ const db = {
   },
 
   deleteProject: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('DELETE FROM projects WHERE id = $1 RETURNING *', [id]);
       return res.rows[0] || null;
@@ -470,6 +548,7 @@ const db = {
 
   // PHOTOS
   getPhotos: async ({ onlyPublished = false } = {}) => {
+    assertDbAvailable();
     if (isPgReady) {
       const query = onlyPublished
         ? "SELECT * FROM photos WHERE status = 'published' ORDER BY sort_order ASC, created_at DESC"
@@ -484,6 +563,7 @@ const db = {
   },
 
   getPhotoById: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('SELECT * FROM photos WHERE id = $1', [id]);
       return res.rows[0] || null;
@@ -493,6 +573,7 @@ const db = {
   },
 
   createPhoto: async (data) => {
+    assertDbAvailable();
     const { title, description = '', category = 'General', image_url, status = 'published', sort_order = 0 } = data;
     if (isPgReady) {
       const res = await pool.query(
@@ -521,6 +602,7 @@ const db = {
   },
 
   updatePhoto: async (id, data) => {
+    assertDbAvailable();
     if (isPgReady) {
       const current = await db.getPhotoById(id);
       if (!current) return null;
@@ -548,6 +630,7 @@ const db = {
   },
 
   deletePhoto: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('DELETE FROM photos WHERE id = $1 RETURNING *', [id]);
       return res.rows[0] || null;
@@ -562,6 +645,7 @@ const db = {
 
   // VIDEOS
   getVideos: async ({ onlyPublished = false } = {}) => {
+    assertDbAvailable();
     if (isPgReady) {
       const query = onlyPublished
         ? "SELECT * FROM videos WHERE status = 'published' ORDER BY sort_order ASC, created_at DESC"
@@ -576,6 +660,7 @@ const db = {
   },
 
   getVideoById: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('SELECT * FROM videos WHERE id = $1', [id]);
       return res.rows[0] || null;
@@ -585,6 +670,7 @@ const db = {
   },
 
   createVideo: async (data) => {
+    assertDbAvailable();
     const {
       title,
       description = '',
@@ -623,6 +709,7 @@ const db = {
   },
 
   updateVideo: async (id, data) => {
+    assertDbAvailable();
     if (isPgReady) {
       const current = await db.getVideoById(id);
       if (!current) return null;
@@ -659,6 +746,7 @@ const db = {
   },
 
   deleteVideo: async (id) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query('DELETE FROM videos WHERE id = $1 RETURNING *', [id]);
       return res.rows[0] || null;
@@ -673,6 +761,7 @@ const db = {
 
   // OVERVIEW COUNTS & RECENT ACTIVITY
   getOverviewMetrics: async () => {
+    assertDbAvailable();
     const certs = await db.getCertificates();
     const projs = await db.getProjects();
     const photos = await db.getPhotos();
@@ -690,7 +779,6 @@ const db = {
       publishedVideos: videos.filter((v) => v.status === 'published').length
     };
 
-    // Combine recent items
     const taggedItems = [
       ...certs.map((i) => ({ ...i, itemType: 'certificate' })),
       ...projs.map((i) => ({ ...i, itemType: 'project' })),
@@ -710,6 +798,7 @@ const db = {
 
   // CONTACT MESSAGES
   createMessage: async (name, email, message) => {
+    assertDbAvailable();
     if (isPgReady) {
       const res = await pool.query(
         'INSERT INTO messages (name, email, message) VALUES ($1, $2, $3) RETURNING *',

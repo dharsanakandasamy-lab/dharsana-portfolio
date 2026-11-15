@@ -6,9 +6,11 @@
     "dev": "npm run dev --prefix frontend",
     "dev:api": "node --watch backend/server.js",
     "build": "npm install --prefix frontend && npm run build --prefix frontend",
-    "start": "node backend/server.js"
+    "start": "node backend/server.js",
+    "migrate:supabase": "node backend/scripts/migrate-to-supabase.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.119.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
