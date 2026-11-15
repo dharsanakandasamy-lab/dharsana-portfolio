@@ -6,6 +6,12 @@ frontend/node_modules/
 frontend/dist/
 dist/
 
+# Local media uploads & local database (persist on disk, avoid committing user media)
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/data/*
+!backend/data/.gitkeep
+
 # Environment and sensitive keys
 .env
 .env.*
